@@ -10,8 +10,15 @@
 const char* ssid = WIFI_SSID;
 const char* password = WIFI_PASS;
 
+// --- Configurações de IP Fixo ---
+IPAddress local_IP(192, 168, 0, 43); 
+IPAddress gateway(192, 168, 0, 1);
+IPAddress subnet(255, 255, 255, 0);
+IPAddress primaryDNS(8, 8, 8, 8);
+IPAddress secondaryDNS(8, 8, 4, 4);
+
 // --- URL do Backend Flask ---
-const char* serverUrl = "http://192.168.0.40:5000/api/sensores";
+const char* serverUrl = "http://192.168.0.82:5000/api/sensores";
 
 // --- Configurações do Sensor DHT11 ---
 #define DHTPIN D2
@@ -24,11 +31,15 @@ DHT dht(DHTPIN, DHTTYPE);
 #define RELAY_ON HIGH
 #define RELAY_OFF LOW
 
-// --- Servidor Web para comandos manuais ---
-ESP8266WebServer server(80);
+// --- Servidor Web na PORTA 80 (padrão HTTP) ---
+ESP8266WebServer server(80); 
 
+// --- Temporizadores ---
 unsigned long ultimoEnvio = 0;
-const long intervalo = 10000; // Envio a cada 10 segundos
+const long intervaloEnvio = 10000; // Envio ao Flask a cada 10s
+
+unsigned long ultimaTentativaWiFi = 0;
+const long intervaloReconexao = 30000; // Tenta reconectar ao Wi-Fi a cada 30s
 
 // Variável para rastrear o status e enviar ao Flask
 String statusUmidificador = "OFF";
@@ -37,13 +48,19 @@ String statusUmidificador = "OFF";
 bool modoManual = false;
 
 void ligarRele() {
-  digitalWrite(RELAY_PIN, RELAY_ON);
-  statusUmidificador = "ON";
+  if (statusUmidificador != "ON") {
+    digitalWrite(RELAY_PIN, RELAY_ON);
+    statusUmidificador = "ON";
+    Serial.println("[HARDWARE] Umidificador LIGADO");
+  }
 }
 
 void desligarRele() {
-  digitalWrite(RELAY_PIN, RELAY_OFF);
-  statusUmidificador = "OFF";
+  if (statusUmidificador != "OFF") {
+    digitalWrite(RELAY_PIN, RELAY_OFF);
+    statusUmidificador = "OFF";
+    Serial.println("[HARDWARE] Umidificador DESLIGADO");
+  }
 }
 
 // --- Handlers HTTP ---
@@ -81,18 +98,26 @@ void handleStatus() {
 
 void setup() {
   Serial.begin(115200);
-  // Garante que o relé comece desligado ANTES de abrir a porta
+  
   pinMode(RELAY_PIN, OUTPUT);
   digitalWrite(RELAY_PIN, RELAY_OFF);
 
   dht.begin();
 
-  Serial.println();
+  Serial.println("\n--- Kampu OS: Iniciando Node de Clima ---");
   Serial.print("Conectando a ");
   Serial.println(ssid);
+
+  // Configurações recomendadas para estabilidade do ESP8266
+  WiFi.persistent(false); 
+  WiFi.setAutoReconnect(true);
+
+  if (!WiFi.config(local_IP, gateway, subnet, primaryDNS, secondaryDNS)) {
+    Serial.println("Falha ao configurar o IP Fixo!");
+  }
+
   WiFi.begin(ssid, password);
 
-  // Tenta conectar por no máximo 10 segundos (20 tentativas de 500ms)
   int tentativas = 0;
   while (WiFi.status() != WL_CONNECTED && tentativas < 20) {
     delay(500);
@@ -100,59 +125,65 @@ void setup() {
     tentativas++;
   }
 
+  // Registra as rotas do servidor web independentemente da conexão inicial
+  server.on("/rele/on", handleReleOn);
+  server.on("/rele/off", handleReleOff);
+  server.on("/rele/auto", handleReleAuto);
+  server.on("/status", handleStatus);
+  server.begin();
+
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("\nWi-Fi conectado!");
     Serial.print("IP do dispositivo: ");
     Serial.println(WiFi.localIP());
-
-    // --- Registra as rotas do servidor web ---
-    server.on("/rele/on", handleReleOn);
-    server.on("/rele/off", handleReleOff);
-    server.on("/rele/auto", handleReleAuto);
-    server.on("/status", handleStatus);
-    server.begin();
-    Serial.println("Servidor HTTP iniciado.");
-    Serial.println("Endpoints: /rele/on  /rele/off  /rele/auto  /status");
   } else {
-    Serial.println("\nFalha no Wi-Fi. Iniciando modo offline (Apenas controle local do relé).");
+    Serial.println("\n[OFFLINE] Falha no Wi-Fi. Operando em modo autônomo local.");
   }
 }
 
 void loop() {
-  // Atende requisições HTTP a cada iteração do loop
-  server.handleClient();
-
   unsigned long tempoAtual = millis();
 
-  if (tempoAtual - ultimoEnvio >= intervalo) {
+  // ==========================================
+  // GERENCIAMENTO DE CONEXÃO (NÃO BLOQUEANTE)
+  // ==========================================
+  if (WiFi.status() != WL_CONNECTED) {
+    if (tempoAtual - ultimaTentativaWiFi >= intervaloReconexao) {
+      ultimaTentativaWiFi = tempoAtual;
+      Serial.println("[WIFI] Conexão perdida. Iniciando tentativa de reconexão em background...");
+      WiFi.disconnect();
+      WiFi.begin(ssid, password); // begin() é assíncrono no ESP8266
+    }
+  } else {
+    // Só atende clientes HTTP se estiver conectado
+    server.handleClient(); 
+  }
+
+  // ==========================================
+  // CONTROLE DO CLIMA E TELEMETRIA
+  // ==========================================
+  if (tempoAtual - ultimoEnvio >= intervaloEnvio) {
     ultimoEnvio = tempoAtual;
 
     float umidade = dht.readHumidity();
     float temperatura = dht.readTemperature();
 
     if (isnan(umidade) || isnan(temperatura)) {
-      Serial.println("Falha ao ler o sensor DHT11!");
+      Serial.println("[ERRO] Falha ao ler o sensor DHT11!");
       return;
     }
 
-    // ==========================================
-    // LÓGICA DE CONTROLE DO UMIDIFICADOR
-    // ==========================================
-    // Só roda automaticamente se NÃO estiver em modo manual
+    // Controle autônomo do umidificador
     if (!modoManual) {
-      // Se a umidade cair abaixo de 70%, liga o atomizador
       if (umidade < 70.0) {
         ligarRele();
       }
-      // Se a umidade chegar a 85% ou mais, desliga o atomizador
       else if (umidade >= 85.0) {
         desligarRele();
       }
     }
 
-    // ==========================================
-    // ENVIO DOS DADOS PARA O FLASK
-    // ==========================================
+    // Se estiver online, tenta mandar para o Flask
     if (WiFi.status() == WL_CONNECTED) {
       WiFiClient client;
       HTTPClient http;
@@ -160,12 +191,11 @@ void loop() {
       http.begin(client, serverUrl);
       http.addHeader("Content-Type", "application/json");
 
-      // Montando o payload JSON (Usando a versão 6 do ArduinoJson baseada no seu platformio.ini)
       StaticJsonDocument<200> doc;
       doc["dispositivo_id"] = "esp8266_node_01";
       doc["temperatura_ar"] = temperatura;
       doc["umidade_ar"] = umidade;
-      doc["umidificador"] = statusUmidificador; // Envia o estado real da máquina
+      doc["umidificador"] = statusUmidificador;
       doc["modo"] = modoManual ? "manual" : "automatico";
 
       String requestBody;
@@ -173,14 +203,14 @@ void loop() {
       int httpResponseCode = http.POST(requestBody);
 
       if (httpResponseCode > 0) {
-        Serial.print("Enviado: ");
+        Serial.print("[FLASK] Sucesso: ");
         Serial.println(requestBody);
       } else {
-        Serial.print("Erro HTTP: ");
-        Serial.println(httpResponseCode);
+        Serial.printf("[FLASK] Erro HTTP: %d. Backend inacessível?\n", httpResponseCode);
       }
-
       http.end();
+    } else {
+      Serial.printf("[OFFLINE] Temp: %.1f°C | Umi: %.1f%% | Relé: %s\n", temperatura, umidade, statusUmidificador.c_str());
     }
   }
 }

@@ -3,9 +3,15 @@
 #include "esp_camera.h"
 #include "esp_http_server.h"
 
-// --- CREDENCIAIS WIFI (hardcoded) ---
+// --- CREDENCIAIS WIFI 
 const char* ssid = WIFI_SSID;
 const char* pass = WIFI_PASS;
+
+// --- CONFIGURAÇÃO DE IP ESTÁTICO ---
+IPAddress local_IP(192, 168, 0, 42); 
+IPAddress gateway(192, 168, 0, 1);   // Atenção: Confirme se o IP do seu roteador é final .1
+IPAddress subnet(255, 255, 255, 0);
+IPAddress primaryDNS(8, 8, 8, 8);
 
 // --- MAPEAMENTO DE HARDWARE ---
 #define PWDN_GPIO_NUM     -1
@@ -64,6 +70,12 @@ void startCameraServer() {
 void connectWiFi() {
   Serial.print("Conectando ao Wi-Fi");
   WiFi.mode(WIFI_STA);
+
+  // --- APLICA O IP FIXO ANTES DE CONECTAR ---
+  if (!WiFi.config(local_IP, gateway, subnet, primaryDNS)) {
+    Serial.println("\n⚠️ Falha ao configurar IP estático!");
+  }
+
   WiFi.begin(ssid, pass);
 
   int tentativas = 0;

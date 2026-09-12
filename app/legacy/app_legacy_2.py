@@ -3,13 +3,16 @@ import time
 import threading
 import cv2
 import numpy as np
+import io
 import json
 import piexif
 import requests
 import urllib.request
 from flask import Flask, render_template, request, jsonify, Response
 from flask_cors import CORS
-from PIL import Image
+from tensorflow.keras.models import load_model
+from tensorflow.keras.preprocessing import image
+from PIL import Image, ImageOps
 
 app = Flask(__name__)
 CORS(app)
@@ -23,7 +26,7 @@ IP_DO_ESP = "192.168.0.42"
 URL_CAPTURE = f"http://{IP_DO_ESP}/capture"
 
 # --- IP DO NODEMCU (Sensor DHT11 + Relé) ---
-IP_DO_NODEMCU = "192.168.0.43"
+IP_DO_NODEMCU = "192.168.0.43"  # <-- ajuste para o IP real, visto no Monitor Serial
 URL_NODEMCU = f"http://{IP_DO_NODEMCU}"
 
 PASTA_ASSETS = os.path.join("assets", "pictures")
@@ -37,14 +40,38 @@ clima_atual = {
 camera_lock = threading.Lock()
 frame_atual = None
 
+# --- IA e Paths ---
+TARGET_SIZE = (224, 224)
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__))) 
+MODELS_DIR = os.path.join(BASE_DIR, 'app', 'models')
+
+CLASSES_ROUTER = ['Pepper', 'Potato', 'Tomato']
+CLASSES_SAUDE_PIMENTA = ['Bacterial Spot', 'Cercospora Leaf Spot', 'Curl Virus', 'Healthy Leaf', 'Nutrition Deficiency', 'White spot']
+CLASSES_CRESCIMENTO_PIMENTA = ['Dry chili', 'Flower', 'Green Chili', 'Red Chili', 'Rotten Chili']
+
+print("\n🌱 Kampu: Carregando sistemas neurais...")
+modelos = {}
+
+def carregar_modelo_seguro(caminho_relativo):
+    full_path = os.path.join(MODELS_DIR, caminho_relativo)
+    if os.path.exists(full_path):
+        print(f"   -> Carregando: {caminho_relativo}...")
+        return load_model(full_path)
+    else:
+        print(f"   ❌ CRÍTICO: Modelo não encontrado em {full_path}")
+        return None
+
+modelos['router'] = carregar_modelo_seguro('router_species.keras')
+modelos['pimenta_saude'] = carregar_modelo_seguro(os.path.join('pepper', 'health.keras'))
+modelos['pimenta_crescimento'] = carregar_modelo_seguro(os.path.join('pepper', 'growth.keras'))
+print("✅ Sistemas online!\n")
+
 # ==========================================
-# 2. PROCESSAMENTO DE IMAGEM E METADADOS
+# 2. IA E METADADOS
 # ==========================================
 
 def salvar_foto_com_metadados(frame, caminho):
     img_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-    
-    # Guarda as informações climáticas no momento em que a foto foi tirada
     dados_sensor = {
         "temp": clima_atual["temperatura"],
         "humi": clima_atual["umidade"],
@@ -52,11 +79,10 @@ def salvar_foto_com_metadados(frame, caminho):
         "timestamp": time.strftime("%Y:%m:%d %H:%M:%S")
     }
     comment_str = json.dumps(dados_sensor)
-    
     exif_dict = {
         "0th": {
             piexif.ImageIFD.DateTime: time.strftime("%Y:%m:%d %H:%M:%S"),
-            piexif.ImageIFD.Software: u"Kampu System Logger"
+            piexif.ImageIFD.Software: u"Kampu System v2"
         },
         "Exif": {
             piexif.ExifIFD.DateTimeOriginal: time.strftime("%Y:%m:%d %H:%M:%S"),
@@ -66,6 +92,21 @@ def salvar_foto_com_metadados(frame, caminho):
     exif_bytes = piexif.dump(exif_dict)
     img_pil.save(caminho, "jpeg", exif=exif_bytes)
     print(f"✅ Foto salva com metadados em: {caminho}")
+
+def preparar_imagem(img_bytes):
+    img = Image.open(io.BytesIO(img_bytes))
+    if img.mode != "RGB": img = img.convert("RGB")
+    img = ImageOps.fit(img, TARGET_SIZE, Image.Resampling.LANCZOS)
+    img_array = image.img_to_array(img)
+    return np.expand_dims(img_array, axis=0)
+
+def consultar_modelo(modelo, img_array, lista_classes):
+    if modelo is None: return "Modelo Off-line", 0.0
+    predicao = modelo.predict(img_array, verbose=0)
+    indice = np.argmax(predicao[0])
+    confianca = float(np.max(predicao[0])) * 100
+    classe = lista_classes[indice] if indice < len(lista_classes) else "Classe Desconhecida"
+    return classe, confianca
 
 # ==========================================
 # 3. THREADS DE REDE (VÍDEO)
@@ -96,7 +137,7 @@ def rotina_captura_periodica():
         except Exception as e:
             print(f"⚠️ Erro ao capturar a foto da Câmera: {e}")
             
-        # Dorme por 10 segundos antes da próxima foto
+        # Dorme por 2 minutos (120 segundos) antes da próxima foto
         time.sleep(10) 
 
 def gerar_stream_web():
@@ -107,10 +148,10 @@ def gerar_stream_web():
                 ret, buffer = cv2.imencode('.jpg', frame_atual)
                 if ret:
                     yield (b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
-        # A página web recarrega o frame local a cada 100ms
+        # A página web recarrega o frame local a cada 100ms, mas a imagem só muda a cada 2 minutos
         time.sleep(0.1)
 
-# Inicia a thread de monitoramento da câmera
+# Inicia a thread de monitoramento da câmera (o clima agora é passivo via webhook)
 threading.Thread(target=rotina_captura_periodica, daemon=True).start()
 
 # ==========================================
@@ -125,6 +166,10 @@ def landing():
 def dashboard(): 
     return render_template('dashboard.html')
 
+@app.route('/ml_vision')
+def ia_legacy(): 
+    return render_template('ml_vision.html')
+
 @app.route('/api/clima')
 def get_clima(): 
     # Usado pelo dashboard frontend para puxar os dados atuais
@@ -134,7 +179,7 @@ def get_clima():
 def video_feed(): 
     return Response(gerar_stream_web(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
-# --- Recebendo os dados do NodeMCU (DHT11) ---
+# --- NOVA ROTA: Recebendo os dados do NodeMCU (DHT11) ---
 @app.route('/api/sensores', methods=['POST'])
 def receber_sensores():
     global clima_atual
@@ -202,6 +247,45 @@ def rele_status():
     dados, status_code = chamar_nodemcu("/status")
     return jsonify(dados), status_code
 
+@app.route('/analisar_planta', methods=['POST'])
+def analisar():
+    inicio = time.time()
+    if 'image' not in request.files:
+        return jsonify({'erro': 'Nenhuma imagem enviada'}), 400
+    
+    img_array = preparar_imagem(request.files['image'].read())
+    response = {"timestamp": time.strftime("%d/%m/%Y - %H:%M")}
+
+    especie_raw, conf_esp = consultar_modelo(modelos.get('router'), img_array, CLASSES_ROUTER)
+    
+    nomes_exibicao = {'Adenium': 'Rosa do Deserto (Adenium)', 'Pepper': 'Pimenta (Capsicum)', 'Potato': 'Batata', 'Tomato': 'Tomate'}
+    especie_exibicao = nomes_exibicao.get(especie_raw, especie_raw)
+    
+    response['especie'] = especie_exibicao
+    response['confianca'] = f"{conf_esp:.1f}%"
+
+    if especie_raw == 'Pepper':
+        saude, conf_saude = consultar_modelo(modelos.get('pimenta_saude'), img_array, CLASSES_SAUDE_PIMENTA)
+        estagio, conf_estagio = consultar_modelo(modelos.get('pimenta_crescimento'), img_array, CLASSES_CRESCIMENTO_PIMENTA)
+        
+        response['saude'] = saude
+        response['estagio'] = estagio
+        
+        if saude != 'Healthy Leaf':
+            response['alerta'], response['classe_alerta'] = f"⚠️ Saria detectou: {saude}.", "alert-danger"
+        elif estagio == 'Rotten Chili':
+            response['alerta'], response['classe_alerta'] = "⚠️ Saria detectou: Fruto Podre.", "alert-danger"
+        else:
+            response['alerta'], response['classe_alerta'] = "✅ Planta vigorosa.", "alert-success"
+    else:
+        response['saude'] = "Modelo Especialista não carregado"
+        response['estagio'] = "Monitoramento Básico"
+        response['alerta'] = f"ℹ️ Identificado {especie_exibicao}."
+        response['classe_alerta'] = "alert-secondary"
+
+    print(f"📸 Processado: {especie_exibicao} | Tempo: {time.time() - inicio:.2f}s")
+    return jsonify(response)
+
 if __name__ == '__main__':
-    print("🚀 Kampu System Logger (Hardware Monitor) iniciado!")
+    print("🚀 Kampu System Full Stack (Hardware + IA) iniciado!")
     app.run(host='0.0.0.0', port=5000, debug=True, use_reloader=False)
